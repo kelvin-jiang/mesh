@@ -27,89 +27,6 @@ from mesh_tensorflow import ops_with_redefined_builtins as mtf
 import tensorflow.compat.v1 as tf
 
 
-@gin.configurable
-def unit_scaling_convention(value=False):
-  """Turn this on with gin to enable the unit-scaling convention.
-
-  TODO(noam): turn this comment into a position paper and post to arxiv
-
-  Under the unit-scaling convention, all weights are initialized with unit
-  variance, and the outputs of most contractions (matmul/einsum operations) are
-  divided by the square-root of the sizes of the contracting dimensions.
-
-  This differs from the typical inverse-square-root weight-initalization
-  convention often attributed to
-  http://proceedings.mlr.press/v9/glorot10a.html
-  in which weights are typically initialized according to a distribution with
-  mean zero and standard-deviation equal to the inverse-square-root of the
-  contracting dimension(s).
-
-  Under both conventions, the purpose of the inverse-square-root scaling is so
-  that activations in a layer should be scaled similarly to the activations in
-  the previous layer.  (Typically, models are initialized so that activations in
-  all layers should have RMS=O(1)).
-
-  The difference between the two conventions is whether this scaling happens in
-  the parameters (their way), or as an explicit multiplier on the activations
-  (our way).
-
-  In our opinion, parameter-scaling (their way) has three main disadvantages:
-
-  1. Optimizers need to be aware of differently-scaled parameters.  This is
-  because the learning-rates of adaptive optimizers represent target step-sizes
-  for the parameters.  The desired step size for a parameter logically depends
-  on the scale of the parameter itself, and so one typically needs to lower the
-  learning-rate when the layers get bigger and the parameters get consequently
-  smaller.  Under the unit-scaling convention, this is unnecessary, since all
-  parameters are on the same unit scale.
-
-  2. It is often unwieldy from an engineering standpoint to communicate to both
-  the variable initializers and to the optimizer what the scale of the variable
-  should be.  Typically, the variable initializer guesses this by inferring from
-  the dimension order which dimension of the variable might represent
-  contracting dimensions.  This is highly error-prone.
-
-  3. Sometimes contractions happen without being associated with parameters, as
-  in neural attention.  It may be important here too to divide by the square
-  root of the contracting dimensions, in order to maintain activation scale.
-  See the discussion in section 3.2.1 of https://arxiv.org/abs/1706.03762
-  Being in the habit of scaling the outputs of contractions in this way makes
-  it more likely to remember to do the same thing in these circumstances.
-
-  Note: When switching to the unit-scaling convention, it is probably necessary
-  to raise the learning rate, since larger parameters need larger updates.  An
-  exception is when using Adafactor, which by default scales the updates
-  relative to the scale of the current parameter values.
-
-  Args:
-    value: a boolean
-  Returns:
-    a boolean
-  """
-  return value
-
-
-def us_einsum(xs, *args, **kwargs):
-  """Einsum with optional unit-scaling convention.
-
-  If the unit-scaling convention is enabled, then divide the output by
-  the square-root of the product of the contracting dimensions.
-
-  Args:
-    xs: a list of mtf.Tensor
-    *args: arguments to mtf.einsum
-    **kwargs: keyword arguments to mtf.einsum
-  Returns:
-    a mtf.Tensor
-  """
-  y = mtf.einsum(xs, *args, **kwargs)
-  if unit_scaling_convention():
-    all_input_dims = set(sum([x.shape.dims for x in xs], []))
-    reduced_dims = [d for d in all_input_dims if d not in y.shape.dims]
-    y *= mtf.Shape(reduced_dims).size ** -0.5
-  return y
-
-
 def dense(x,
           new_dims,
           reduced_dims=None,
@@ -178,7 +95,7 @@ def dense(x,
                                               master_dtype, slice_dtype)
 
   with tf.variable_scope(name, default_name="dense"):
-    y = us_einsum([x, kernel_weights], output_shape)
+    y = mtf.einsum([x, kernel_weights], output_shape)
     if use_bias:
       b = mtf.get_variable(
           x.mesh,
@@ -297,11 +214,9 @@ class VarianceScalingInitializer(DenseInitializer):
   With `distribution="normal"`, samples are drawn from a truncated normal
   distribution centered on zero, with `stddev = sqrt(scale / n)` where n is:
 
-    1.0 if unit_scaling_convention() is turned on
-    otherwise:
-      number of input units in the weight tensor, if mode = "fan_in"
-      number of output units, if mode = "fan_out"
-      average of the numbers of input and output units, if mode = "fan_avg"
+      - number of input units in the weight tensor, if mode = "fan_in"
+      - number of output units, if mode = "fan_out"
+      - average of the numbers of input and output units, if mode = "fan_avg"
 
   With `distribution="uniform"`,
   samples are drawn from a uniform distribution
@@ -326,15 +241,10 @@ class VarianceScalingInitializer(DenseInitializer):
     fan_out = mtf.list_product(d.size for d in new_dims)
     scale = self.scale
     if self.mode == "fan_in":
-      if not unit_scaling_convention():
-        scale /= max(1., fan_in)
+      scale /= max(1., fan_in)
     elif self.mode == "fan_out":
-      if unit_scaling_convention():
-        raise ValueError("Unit scaling convention only works with \"fan_in\"")
       scale /= max(1., fan_out)
     elif self.mode == "fan_avg":
-      if unit_scaling_convention():
-        raise ValueError("Unit scaling convention only works with \"fan_in\"")
       scale /= max(1., float(fan_in + fan_out) / 2)
     else:
       raise ValueError(
@@ -403,10 +313,8 @@ def _depthwise_conv1d_hack(x,
     name: str, variable_scope name,
     use_bias: Bool, whether to use bias,
     initializer_scale: int, initalizer scale,
-    kernel_depth_weights: an optional list of kernel weight tensors. The list
-    contains one element for each relative position in the kernel. Each element
-    has a width equal to the depth over which the separable conv operation is
-    being "separated"
+    kernel_depth_weights: an optional list of kernel weight tensors, one for
+      each relative position
 
   Returns:
     an mtf.Tensor
@@ -441,8 +349,7 @@ def separable_conv1d(x,
                      depthwise_filter_initializer_scale=1.0,
                      pointwise_filter_initializer_scale=1.0,
                      name=None,
-                     use_bias=True,
-                     kernel_depth_weights=None):
+                     use_bias=True):
   """1-D convolution with separable filters.
 
   The filter size will be `max_relative_pos - min_relative_pos + 1`.
@@ -462,10 +369,6 @@ def separable_conv1d(x,
       initializer for the pointwise filter.
     name: a string used for tf.variable_scope.
     use_bias: a bool, whether to use bias in the convolutions.
-    kernel_depth_weights: an optional list of kernel weight tensors. The list
-    contains one element for each relative position in the kernel. Each element
-    has a width equal to the dimension over which the separable conv operation
-    is being "separated"
 
   Returns:
     a mtf.Tensor of format NWO, where O is the output dimension.
@@ -480,8 +383,7 @@ def separable_conv1d(x,
         min_relative_pos=min_relative_pos,
         max_relative_pos=max_relative_pos,
         use_bias=use_bias,
-        initializer_scale=depthwise_filter_initializer_scale,
-        kernel_depth_weights=kernel_depth_weights)
+        initializer_scale=depthwise_filter_initializer_scale)
     return dense(
         depthwise,
         new_dims=[output_dim],

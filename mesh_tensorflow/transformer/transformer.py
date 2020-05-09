@@ -22,7 +22,7 @@ mesh-tensorflow Transformer implementation in the Tensor2Tensor library.
 The interface is for the user to create a Unitransformer or Bitransformer
 object and then call its methods (call_simple, sample_autoregressive, etc.)
 The Unitransformer or Bitransformer is configured by creating a LayerStack
-object containing instances of TransformerLayer.  Users can subclass
+object contiaining instances of TransformerLayer.  Users can subclass
 TransformerLayer to create new types of layers.
 
 Supported so far:
@@ -32,11 +32,15 @@ Supported so far:
  - fast autoregressive sampling with temperature
  - beam search
  - mixture of experts layer
- - local attention layer
+ - local attetion layer
+ - wrapper for tensor2tensor (MtfTransformer2)
  - shared embedding / shared embedding and softmax weights
 
 Not yet supported:  TODO(noam)
  - compressed attention layer
+ - training binary without tensor2tensor
+
+TODO(noam): move Unitransformer and Bitransformer classes to top of file.
 """
 
 from __future__ import absolute_import
@@ -60,7 +64,7 @@ class TransformerLayer(object):
   library.
 
   Transformer layers should subclass TransformerLayer.  In the constructor, the
-  subclasses simply record their hyperparameters.  Subclasses must implement a
+  subclasses simply record their hyperparmeters.  Subclasses must implement a
   call() method, representing a call to that layer.  The call method is passed
   an input tensor and a Context object.  Variables should be created inside of
   the call().
@@ -153,7 +157,7 @@ class Context(object):
       length_dim: a mtf.Dimension
       variable_dtype: a mtf.VariableDType
       beam_dim: an optional mtf.Dimension (present in beam search)
-      mode: either a tf.estimator.ModeKeys or one of the following:
+      mode: either a tf.estimator.ModeKeys or one of the follwing:
         "first_part"
         "incremental"
       position: an optional Tensor - represents position in the sequence.
@@ -217,8 +221,6 @@ class Context(object):
     self.losses = losses
     self.initial_position = initial_position
     self.layer_outputs = layer_outputs
-    if self.layer_outputs is None:
-      self.layer_outputs = []
     self.encoder_output = encoder_output
     self.encoder_sequence_id = encoder_sequence_id
     self.constant_states = constant_states
@@ -241,12 +243,6 @@ class Context(object):
   @property
   def activation_dtype(self):
     return self.variable_dtype.activation_dtype
-
-  @property
-  def encoder_length_dim(self):
-    ret, = [d for d in self.encoder_output.shape.dims
-            if d.name == "memory_length"]
-    return ret
 
   def get_states(self, n):
     """Get the next n recurrent states.
@@ -310,143 +306,638 @@ class Context(object):
 
 
 @gin.configurable
-class LayerStack(TransformerLayer):
-  """A stack of layers with residual connections and layer norms."""
+class UTLayerStack(TransformerLayer):
+  """A stack of layers for Universal Transformer.
 
-  def __init__(self,
-               layers,
-               sublayers_initial=None,
-               sublayers_per_layer=None,
-               sublayers_final=None,
-               dropout_rate=None,
-               norm_epsilon=None,
-               recompute_grads=False):
-    """Create a LayerStack.
+  This implementation is largely adapted from t2t universal transformer
+  implementation. Reference:
+  third_party/py/tensor2tensor/models/research
+  """
 
-    `layers` is a list of TransformerLayer objects representing the
-    building blocks of the transformer model, e.g.
-    transformer_layers.SelfAttention.
-
-    In addition, there are a bunch of other transformations which occur around
-    the layer body, and at the beginning and the end of the layer stack.  We
-    call these "sublayers".  They are configurable with the `sublayers_initial`,
-    `sublayers_per_layer`, and `sublayers_final` arguments, each of which takes
-    a list of sublayer functions.
-
-    Each of the sublayer functions has signature:
-      x, layer_stack, context -> y
-    where x is the input tensor and y is the output tensor.
-
-    The default sublayers specified in defaults.gin are:
-
-      transformer.LayerStack.sublayers_initial = [
-          @transformer.sublayer_dropout,
-      ]
-      transformer.LayerStack.sublayers_per_layer = [
-          @transformer.sublayer_rms_norm,
-          @transformer.sublayer_call_layer,
-          @transformer.sublayer_dropout,
-          @transformer.sublayer_residual,
-      ]
-      transformer.LayerStack.sublayers_final = [
-          @transformer.sublayer_rms_norm,
-          @transformer.sublayer_dropout,
-      ]
-
-    Refer to these as examples of how to write and call your own sublayer
-    functions.
-
-    `dropout_rate` and `norm_epsilon` should only be specified in a legacy mode,
-    for compatiblity with older checkpoints.
+  def __init__(
+      self,
+      layers,
+      dropout_rate=0.0,
+      norm_epsilon=1e-6,
+      num_vanilla_transformer_layers=2,
+      couple_carry_transform_gates=True,
+      act_type=gin.REQUIRED,
+      recurrence_type=gin.REQUIRED,
+      act_max_steps=gin.REQUIRED,
+      act_epsilon=gin.REQUIRED,
+      num_rec_steps=gin.REQUIRED,
+      num_inrecurrence_layers=gin.REQUIRED,
+      position_start_index=gin.REQUIRED,
+      add_or_concat_timing_signal=gin.REQUIRED,
+      step_timing_signal_type=gin.REQUIRED,
+      add_position_timing_signal=gin.REQUIRED,
+      add_step_timing_signal=gin.REQUIRED,
+      mix_with_transformer_before_ut=gin.REQUIRED,
+      mix_with_transformer_after_ut=gin.REQUIRED,
+      gates_inputs=gin.REQUIRED,
+      gate_ffn_layer=gin.REQUIRED,
+  ):
+    """Create a LayerStack for Universal Transformer.
 
     Args:
       layers: a list of TransformerLayer
-      sublayers_initial: an optional list of sublayer functions
-      sublayers_per_layer: an optional list of sublayer functions
-      sublayers_final: an optional list of sublayer functions
-      dropout_rate: DEPRECATED - a floating-point number
-      norm_epsilon: DEPRECATED - a floating-point number
-      recompute_grads: a boolean
+      dropout_rate: a floating-point number
+      norm_epsilon: a floating-point number
+      num_vanilla_transformer_layers: number of vanilla transformer layers
+        before the ACT layer.
+      couple_carry_transform_gates: whether to couple carry and transform gates.
+      act_type: act type
+      recurrence_type: recurrence type (allowable values: "act").
+      act_max_steps: maximum number of act steps
+      act_epsilon: halting threshold
+      num_rec_steps: maximum number of recurrent steps
+      num_inrecurrence_layers: number of inrecurrence layers
+      position_start_index: start index in embedding
+      add_or_concat_timing_signal: bool,
+      whether to add or concat the timing signal
+      step_timing_signal_type: step timing signal type
+      add_position_timing_signal: bool, whether to add position timing signal
+      add_step_timing_signal: bool, whether to add step timing signal
+      mix_with_transformer_before_ut: whether to mix transformer layers before
+        ut.
+      mix_with_transformer_after_ut: whether to mix transformer layers after ut.
+      gates_inputs: controlling the cary/transform gate.
+      gate_ffn_layer: gate ff layer type
     """
     self._layers = layers
-    self._recompute_grads = recompute_grads
-    self._sublayers_initial = sublayers_initial
-    self._sublayers_per_layer = sublayers_per_layer
-    self._sublayers_final = sublayers_final
-    if (dropout_rate is not None) != (norm_epsilon is not None):
-      raise ValueError(
-          "LayerStack.dropout_rate and LayerStack.norm_epsilon should either "
-          "be both not None (legacy mode) or both None (normal mode)")
-    if dropout_rate is not None:
-      self._legacy_init(dropout_rate, norm_epsilon)
+    self._dropout_rate = dropout_rate
+    self._norm_epsilon = norm_epsilon
+    self.num_vanilla_transformer_layers = num_vanilla_transformer_layers
+    self.act_type = act_type
+    self.recurrence_type = recurrence_type
+    self.act_max_steps = act_max_steps
+    self.act_epsilon = act_epsilon
+    self.num_rec_steps = num_rec_steps
+    self.num_inrecurrence_layers = num_inrecurrence_layers
+    self.position_start_index = position_start_index
+    self.add_or_concat_timing_signal = add_or_concat_timing_signal
+    self.step_timing_signal_type = step_timing_signal_type
+    self.add_position_timing_signal = add_position_timing_signal
+    self.add_step_timing_signal = add_step_timing_signal
+    self.mix_with_transformer_before_ut = mix_with_transformer_before_ut
+    self.mix_with_transformer_after_ut = mix_with_transformer_after_ut
+    self.gates_inputs = gates_inputs
+    self.gate_ffn_layer = gate_ffn_layer
+    self.couple_carry_transform_gates = couple_carry_transform_gates
 
-  def _legacy_init(self, dropout_rate, norm_epsilon):
-    """Legacy initialization for use with old checkpoints.
+  def get_timing_signal_1d(self,
+                           context,
+                           length,
+                           channels,
+                           min_timescale=1.0,
+                           max_timescale=1.0e4,
+                           start_index=0):
+    """Gets a bunch of sinusoids of different frequencies.
 
-    dropout_rate and norm_epsilon are specified in LayerStack.
-    Custom sublayers are not specified.
+    Each channel of the input Tensor is incremented by a sinusoid of a different
+    frequency and phase.
+
+    This allows attention to learn to use absolute and relative positions.
+    Timing signals should be added to some precursors of both the query and the
+    memory inputs to attention.
+
+    The use of relative position is possible because sin(x+y) and cos(x+y) can
+    be expressed in terms of y, sin(x) and cos(x).
+
+    In particular, we use a geometric sequence of timescales starting with
+    min_timescale and ending with max_timescale.  The number of different
+    timescales is equal to channels / 2. For each timescale, we
+    generate the two sinusoidal signals sin(timestep/timescale) and
+    cos(timestep/timescale).  All of these sinusoids are concatenated in
+    the channels dimension.
 
     Args:
-      dropout_rate: a float
-      norm_epsilon: a float
+      context: mtf context.
+      length: a mtf.Dimension, length of timing signal sequence.
+      channels: a mtf.Dimension, size of timing embeddings to create.
+      The number of different timescales is equal to channels / 2.
+      min_timescale: a float
+      max_timescale: a float
+      start_index: index of first position
+
+    Returns:
+      a Tensor of timing signals [1, length, channels]
     """
-    self.dropout_rate = dropout_rate
-    self.norm_epsilon = norm_epsilon
-    if (self._sublayers_initial is not None or
-        self._sublayers_per_layer is not None or
-        self._sublayers_final is not None):
-      tf.logging.warning("legacy mode - ignoring custom sublayers")
-    self._sublayers_initial = [sublayer_legacy_dropout]
-    self._sublayers_per_layer = [sublayer_legacy_rms_norm,
-                                 sublayer_call_layer,
-                                 sublayer_legacy_dropout,
-                                 sublayer_residual]
-    self._sublayers_final = [sublayer_legacy_final_rms_norm,
-                             sublayer_legacy_dropout]
+
+    position = context.get_position() + start_index
+    num_timescales = mtf.constant(context.mesh, channels.size // 2)
+    log_timescale_increment = (
+        math.log(float(max_timescale) / float(min_timescale)) /
+        mtf.maximum(num_timescales - 1, 1))
+    channel_dim_name = channels.name
+    inv_timescales = (
+        min_timescale * mtf.exp(
+            mtf.mtf_range(context.mesh,
+                          mtf.Dimension(channel_dim_name, channels.size // 2),
+                          context.activation_dtype) * -log_timescale_increment))
+
+    scaled_time = position * inv_timescales
+    # Please note that this slightly differs from the published paper.
+    # See a discussion here:
+    # https://github.com/tensorflow/tensor2tensor/pull/177
+    #    concat_dim_name = scaled_time.shape.dimension_names[1]
+    concat_dim_name = channels.name
+    signal = mtf.concat(
+        [mtf.sin(scaled_time), mtf.cos(scaled_time)],
+        concat_dim_name=concat_dim_name)
+
+    if channels.size % 2 != 0:
+      raise NotImplementedError("Odd channel size not implemented.")
+    new_dims = [mtf.Dimension("expanded", 1)
+               ] + length.shape.dims + channels.shape.dim
+    signal = mtf.reshape(signal, mtf.Shape(new_dims))
+    return signal
+
+  def add_position_timing_signal_func(self, context, x, step):
+    """Add n-dimensional embedding as the position (horizontal) timing signal.
+
+    Args:
+      context: mtf context
+      x: a tensor with shape [batch, length, depth]
+      step: step
+
+    Returns:
+      a Tensor with the same shape as x.
+
+    """
+
+    if not self.position_start_index:
+      index = 0
+
+    elif self.position_start_index == "random":
+      # Shift all positions randomly
+      # TODO(dehghani): What would be reasonable for max number of shift?
+      index = mtf.random_uniform(
+          context.mesh, [], maxval=x.shape.dims[1].size, dtype=tf.int32)
+
+    elif self.position_start_index == "step":
+      # Shift positions based on the step
+      if self.recurrence_type == "act":
+        num_steps = self.act_max_steps
+      else:
+        num_steps = self.num_rec_steps
+      index = mtf.cast(x.shape.dims[1].size * step / num_steps, dtype=tf.int32)
+
+    length = context.length_dim
+    channels = context.model.model_dim
+    signal = self.get_timing_signal_1d(
+        context, length, channels, start_index=index)
+
+    if self.add_or_concat_timing_signal == "add":
+      x_with_timing = x + mtf.cast(signal, x.dtype)
+    # Unimplemented
+    if self.add_or_concat_timing_signal == "concat":
+      batch_dim = x.shape.dims[0]
+      out_shape = mtf.Shape([batch_dim] + signal.shape.dims[1:])
+      signal_tiled = mtf.broadcast(signal, out_shape)
+      x_with_timing = mtf.concat(
+          (x, signal_tiled), concat_dim_name=signal_tiled.dimension_names[-1])
+
+    return x_with_timing
+
+  def get_layer_timing_signal_learned_1d(self, context, channels, layer,
+                                         num_layers):
+    """get n-dimensional embedding as the layer (vertical) timing signal.
+
+    Adds embeddings to represent the position of the layer in the tower.
+
+    Args:
+      context: mtf context
+      channels: dimension of the timing signal
+      layer: layer num
+      num_layers: total number of layers
+
+    Returns:
+      a Tensor of timing signals [channels].
+    """
+    layer_dim = mtf.Dimension("layer", num_layers)
+    shape = mtf.Shape([layer_dim, channels])
+    layer_embedding = (
+        mtf.get_variable(
+            context.mesh,
+            "layer_embedding",
+            shape,
+            dtype=context.variable_dtype,
+            initializer=tf.random_normal_initializer(0, channels.size**-0.5)) *
+        (channels.size**0.5))
+    return mtf.gather(layer_embedding, layer, layer_dim)
+
+  def add_step_timing_signal_func(self, context, x, step):
+    """Add n-dimensional embedding as the step (vertical) timing signal.
+
+    Args:
+      context: mtf context
+      x: a tensor with shape [batch, length, depth]
+      step: step
+
+    Returns:
+      a Tensor with the same shape as x.
+
+    """
+    if self.recurrence_type == "act":
+      num_steps = self.act_max_steps
+    else:
+      num_steps = self.num_rec_steps
+    channels = x.shape.dims[-1]
+
+    if self.step_timing_signal_type == "learned":
+      signal = self.get_layer_timing_signal_learned_1d(context, channels, step,
+                                                       num_steps)
+    elif self.step_timing_signal_type == "sinusoid":
+      signal = self.get_layer_timing_signal_sinusoid_1d(context, channels, step,
+                                                        num_steps)
+    if self.add_or_concat_timing_signal == "add":
+      x_with_timing = x + mtf.cast(signal, x.dtype)
+    elif self.add_or_concat_timing_signal == "concat":
+      batch_dim = x.shape.dims[0]
+      out_shape = mtf.Shape([batch_dim] + x.shape.dims[1:])
+      signal_tiled = mtf.broadcast(signal, out_shape)
+      x_with_timing = mtf.concat(
+          (x, signal_tiled), concat_dim_name=signal_tiled.dimension_names[-1])
+
+    return x_with_timing
+
+  def step_preprocess(self, context, x, step):
+    """Preprocess the input at the beginning of each step.
+
+    Args:
+      context: mtf context
+      x: input tensor
+      step: step
+
+    Returns:
+      preprocessed input.
+
+    """
+    original_channel_size = x.shape.dims[-1]
+
+    if self.add_step_timing_signal:
+      x = self.add_step_timing_signal_func(context, x, step)
+    if ((self.add_position_timing_signal or self.add_position_timing_signal) and
+        self.add_or_concat_timing_signal == "concat"):
+      # linear projection to the original dimension of x
+      new_dims = x.shape.dims[:-1] + [original_channel_size]
+      x = mtf.layers.dense(
+          x, variable_dtype=context.variable_dtype,
+          new_dims=new_dims, activation=None, use_bias=False)
+      # TODO(yanqiz): implement sru in a separate CL
+
+    return x
+
+  def vanilla_transformer_layer(self, context, x, mask):
+    """Build a vanilla transformer layer."""
+
+    for lnum, layer in enumerate(self._layers):
+      scope_name = layer.name
+      with tf.variable_scope(scope_name or ""):
+        norm_x = self._layer_norm(context, (x * mask) if mask else x)
+        with tf.variable_scope(layer.__class__.__name__):
+          y = layer.call(context, norm_x)
+          if y.shape != x.shape:
+            raise ValueError("Layer %s returned misshaped output x=%s y=%s" %
+                             (layer.__class__.__name__, x, y))
+        x += self._dropout(context, y)
+      if context.layer_outputs is not None and lnum != len(self._layers) - 1:
+        context.layer_outputs.append(x)
+      context.layer_index += 1
+    return x
+
+  def ut_basic(self, context, x, mask):
+    def ut_function(x, step):
+      new_state = self.step_preprocess(context, x, step)
+      for _ in range(self.num_inrecurrence_layers):
+        new_state = self.vanilla_transformer_layer(context, new_state, mask)
+      return new_state
+    for i in range(self.num_rec_steps):
+      x = ut_function(x, i)
+    return x
+
+  def act_layer(self, context, x, mask):
+    """Build a Universal Transformer ACT layer."""
+    state = x
+    act_max_steps = self.act_max_steps
+    threshold = 1.0 - self.act_epsilon
+    state_shape_static = state.shape.dims
+
+    state_slice = slice(0, 3)
+    if self.act_type == "global":
+      state_slice = slice(0, 2)
+
+    # Dynamic shape for update tensors below
+    update_shape = state_shape_static[state_slice]
+
+    # Halting probabilities (p_t^n in the paper)
+    halting_probability = mtf.zeros(
+        context.mesh, update_shape, dtype=context.activation_dtype)
+
+    # Remainders (R(t) in the paper)
+    remainders = mtf.zeros(
+        context.mesh, update_shape, dtype=context.activation_dtype)
+
+    # Number of updates performed (N(t) in the paper)
+    n_updates = mtf.zeros(
+        context.mesh, update_shape, dtype=context.activation_dtype)
+
+    # Previous cell states (s_t in the paper)
+    previous_state = mtf.zeros_like(state)
+    step = mtf.constant(context.mesh, 0, dtype=tf.int32)
+
+    def ut_function(state, step, halting_probability, remainders, n_updates,
+                    previous_state):
+      """implements act (position-wise halting).
+
+      Args:
+        state: 3-D Tensor: [batch_size, length, channel]
+        step: indicates number of steps taken so far
+        halting_probability: halting probability
+        remainders: act remainders
+        n_updates: act n_updates
+        previous_state: previous state
+
+      Returns:
+        transformed_state: transformed state
+        step: step+1
+        halting_probability: halting probability
+        remainders: act remainders
+        n_updates: act n_updates
+        new_state: new state
+      """
+      state = self.step_preprocess(context, state, step)
+
+      if self.act_type == "random":
+        # random as halting probability
+        p = mtf.random_uniform(
+            context.mesh,
+            shape=halting_probability.shape.dims,
+            dtype=context.variable_dtype)
+      else:
+        last_dim_name = state.shape.dimension_names[-1]
+        new_dims = [mtf.Dimension(last_dim_name, 1)]
+        with tf.variable_scope(
+            "sigmoid_activation_for_pondering", reuse=tf.AUTO_REUSE):
+          p = mtf.layers.dense(
+              state,
+              variable_dtype=context.variable_dtype,
+              reduced_dims=[state.shape.dims[-1]],
+              new_dims=new_dims,
+              activation=mtf.sigmoid,
+              use_bias=True)
+          if self.act_type == "global":
+            # average over all positions (as a global halting prob)
+            p = mtf.reduce_mean(p, reduced_dim=p.shape.dims[1])
+            p = mtf.squeeze(p)
+          else:
+            # maintain position-wise probabilities
+            new_shape = p.shape.dims[:-1]
+            p = mtf.reshape(p, new_shape)
+      # Mask for inputs which have not halted yet
+      still_running = mtf.cast(
+          mtf.less(halting_probability, 1.0), context.activation_dtype)
+
+      # Mask of inputs which halted at this step
+      new_halted = mtf.cast(
+          mtf.greater(halting_probability + p * still_running, threshold),
+          context.activation_dtype) * still_running
+      # Mask of inputs which haven't halted, and didn't halt this step
+      still_running = mtf.cast(
+          mtf.less_equal(halting_probability + p * still_running, threshold),
+          context.activation_dtype) * still_running
+
+      # Add the halting probability for this step to the halting
+      # probabilities for those input which haven't halted yet
+      halting_probability += p * still_running
+
+      # Compute remainders for the inputs which halted at this step
+      remainders += new_halted * (1 - halting_probability)
+
+      # Add the remainders to those inputs which halted at this step
+      halting_probability += new_halted * remainders
+
+      # Increment n_updates for all inputs which are still running
+      n_updates += still_running + new_halted
+
+      # Compute the weight to be applied to the new state and output
+      # 0 when the input has already halted
+      # p when the input hasn't halted yet
+      # the remainders when it halted this step
+      input_tensor = p * still_running + new_halted * remainders
+      update_weights = input_tensor
+
+      # apply transformation on the state
+      transformed_state = state
+
+      for _ in range(self.num_inrecurrence_layers):
+        transformed_state = self.vanilla_transformer_layer(
+            context, transformed_state, mask)
+
+      # update running part in the weighted state and keep the rest
+      new_state = ((transformed_state * update_weights) +
+                   (previous_state * (1 - update_weights)))
+
+      if self.act_type == "accumulated":
+        # Add in the weighted state
+        new_state = (transformed_state * update_weights) + previous_state
+
+      step += 1
+
+      return (transformed_state, step, halting_probability, remainders,
+              n_updates, new_state)
+
+    for _ in range(act_max_steps + 1):
+      (state, step, halting_probability, remainders, n_updates,
+       previous_state) = ut_function(state, step, halting_probability,
+                                     remainders, n_updates, previous_state)
+    ponder_times = n_updates
+
+    mtf.scalar_summary("ponder_times", mtf.reduce_mean(ponder_times))
+    return previous_state
+
+  def ffn_layer_multi_inputs(self,
+                             context,
+                             mask,
+                             inputs_list,
+                             ffn_layer_type="dense",
+                             kernel_initializer=None,
+                             activation=None,
+                             preprocess=False,
+                             postprocess=False):
+    """Implements a Feed-forward layer with multiple inputs, pad-removing, etc.
+
+    Args:
+      context: mtf context
+      mask: mask
+      inputs_list: list of input tensors
+      ffn_layer_type: dense / dense_dropconnect/ dense_relu_dense
+      kernel_initializer: kernel initializer
+      activation: activation function
+      preprocess: if preprocess the input --> default: layer-norm
+      postprocess: if postprocess the output --> default: drop-out and residual
+
+    Returns:
+      a tensor
+    Raises:
+      ValueError: Unknown ffn_layer type.
+
+    """
+
+    # need at least one inputs
+    num_inputs = len(inputs_list)
+    assert num_inputs > 0
+
+    if preprocess:
+      # In case of having more than one input to the ffn,
+      # we just apply layer norm on them independently as preprocessing
+      for i, inputs in enumerate(inputs_list):
+        inputs_list[i] = self._layer_norm(
+            context, (inputs * mask) if mask else inputs)
+
+    # the output size is the hidden size of the main inputs
+    main_input = inputs_list[0]
+    original_shape = main_input.shape
+    hidden_size = original_shape.dims[-1].size
+
+    ffn_inputs = inputs_list[0]
+    if len(inputs_list) != 1:
+      ffn_inputs = mtf.concat(inputs_list, original_shape.dims[-1].name)
+    if ffn_layer_type == "dense":
+      last_dims = [
+          mtf.Dimension(ffn_inputs.shape.dims[-1].name, hidden_size)
+      ]
+      output = mtf.layers.dense(
+          ffn_inputs,
+          reduced_dims=[context.model.model_dim],
+          new_dims=last_dims,
+          activation=activation,
+          use_bias=True,
+          variable_dtype=context.variable_dtype,
+          expert_dims=context.model.ensemble_dims,
+          kernel_initializer=kernel_initializer)
+    elif ffn_layer_type == "dense_relu_dense":
+      output = mtf.layers.dense_relu_dense(
+          ffn_inputs,
+          hidden_channels=context.model.model_dim,
+          dropout=self.relu_dropout
+      )
+
+    else:
+      raise ValueError("Unknown ffn_layer type: %s" % ffn_layer_type)
+
+    if postprocess:
+      output = self._layer_norm(context, (output * mask) if mask else output)
+
+    return output
+
+  def ut_highway(self, context, layer_inputs, mask):
+    """A highway network layer."""
+    def ut_function(x, step):
+      """highway layer implementation."""
+      state, inputs, memory = x
+      new_state = self.step_preprocess(context, state, step)
+      for _ in range(self.num_inrecurrence_layers):
+        new_state = self.vanilla_transformer_layer(context, new_state, mask)
+      transformed_state = new_state
+
+      gate_inputs = []
+      if "s" in self.gates_inputs:
+        gate_inputs.append(state)
+      if "t" in self.gates_inputs:
+        gate_inputs.append(transformed_state)
+      if "i" in self.gates_inputs:
+        gate_inputs.append(inputs)
+      gate_ffn_layer = self.gate_ffn_layer
+
+      transform_gate = self.ffn_layer_multi_inputs(
+          context,
+          mask,
+          gate_inputs,
+          ffn_layer_type=gate_ffn_layer,
+          activation=mtf.sigmoid,
+          preprocess=True)
+      if self.couple_carry_transform_gates:
+        carry_gate = mtf.sub(1.0, transform_gate, name="carry")
+      else:
+        carry_gate = self.ffn_layer_multi_inputs(
+            context,
+            mask,
+            gate_inputs,
+            ffn_layer_type=gate_ffn_layer,
+            activation=tf.sigmoid,
+            preprocess=True)
+      new_state = state * carry_gate + transformed_state * transform_gate
+
+      mtf.scalar_summary("highway_transform_gate_layer",
+                         mtf.reduce_mean(transform_gate))
+      mtf.scalar_summary("highway_carry_gate_layer",
+                         mtf.reduce_mean(carry_gate))
+
+      return new_state, inputs, memory
+    for i in range(self.num_rec_steps):
+      layer_inputs = ut_function(layer_inputs, i)
+    output, _, _ = layer_inputs
+    return output
 
   def call(self, context, x):
     """Call the layer stack."""
-    x = self._call_sublayers(self._sublayers_initial, x, context)
-    context.layer_outputs.append(x)
-    for lnum, layer in enumerate(self._layers):
-      with tf.variable_scope(layer.name or ""):
-        if self._recompute_grads:
-          def fn(x, l=layer, c=context):
-            return self._layer_fn(x, l, c)
-          x = mtf.recompute_grad(fn, [x])
-        else:
-          x = self._layer_fn(x, layer, context)
-      if lnum != len(self._layers) - 1:
-        context.layer_outputs.append(x)
-      context.layer_index += 1
-    x = self._call_sublayers(self._sublayers_final, x, context)
-    x = sublayer_mask_padding(x, self, context)
-    context.layer_outputs.append(x)
+    if isinstance(context.sequence_id, mtf.Tensor):
+      # We use this mask to zero out the padding regions at each layer.
+      # This "fixes" a bug where extreme values leak from the padding into the
+      # non-padding regions.
+      # TODO(noam): undertand this better and make a more principled fix.
+      mask = mtf.cast(
+          mtf.not_equal(context.sequence_id, 0), context.activation_dtype)
+    else:
+      mask = None
+    x = self._dropout(context, x)
+    if context.layer_outputs is not None:
+      context.layer_outputs.append(x)
+    if self.mix_with_transformer_before_ut:
+      for _ in range(self.num_vanilla_transformer_layers):
+        x = self.vanilla_transformer_layer(context, x, mask)
+    # Call a ACT layer
+    if self.recurrence_type == "act":
+      x = self.act_layer(context, x, mask)
+    elif self.recurrence_type == "basic":
+      x = self.ut_basic(context, x, mask)
+    elif self.recurrence_type == "highway":
+      layer_inputs = (x, x, x)
+      x = self.ut_highway(context, layer_inputs, mask)
+    if self.mix_with_transformer_after_ut:
+      for _ in range(self.num_vanilla_transformer_layers):
+        x = self.vanilla_transformer_layer(context, x, mask)
+    x = self._layer_norm(context, x, name="final_layer_norm")
+    x = self._dropout(context, x)
+    if mask:
+      x *= mask
+    if context.layer_outputs is not None:
+      context.layer_outputs.append(x)
     return x
 
-  def _call_sublayers(self, sublayers, x, context):
-    for s in sublayers:
-      x = s(x, self, context)
-    return x
+  def _dropout(self, context, x):
+    if context.train and self._dropout_rate > 0:
+      return mtf.dropout(
+          x,
+          rate=self._dropout_rate,
+          noise_shape=mtf.Shape(context.batch_dims + [context.model.model_dim]))
+    else:
+      return x
 
-  def _layer_fn(self, x, layer, context):
-    """Call the layer and its associated sublayers.
+  def _layer_norm(self, context, x, name=None):
+    """Layer normalization.
 
     Args:
-      x: a Tensor
-      layer: a Layer
       context: a Context
+      x: a Tensor
+      name: an optional string
+
     Returns:
       a Tensor
     """
-    context.current_layer = layer
-    context.current_layer_input = x
-    y = self._call_sublayers(self._sublayers_per_layer, x, context)
-    if y.shape != x.shape:
-      raise ValueError(
-          "Layer %s returned misshaped output x=%s y=%s"
-          % (layer.__class__.__name__, x, y))
-    return y
+    return layer_norm(context, x, self._norm_epsilon, name)
 
   @property
   def num_layers(self):
@@ -458,130 +949,101 @@ class LayerStack(TransformerLayer):
 
 
 @gin.configurable
-def sublayer_call_layer(x, layer_stack, context):
-  x = sublayer_mask_padding(x, layer_stack, context)
-  layer = context.current_layer
-  with tf.variable_scope(layer.__class__.__name__):
-    return layer.call(context, x)
+class LayerStack(TransformerLayer):
+  """A stack of layers with residual connections and layer norms."""
 
+  def __init__(self, layers, dropout_rate=0.0, norm_epsilon=1e-6,
+               recompute_grads=False):
+    """Create a LayerStack.
 
-@gin.configurable
-def sublayer_mask_padding(x, layer_stack, context):
-  """Zero out padding regions.
+    Args:
+      layers: a list of TransformerLayer
+      dropout_rate: a floating-point number
+      norm_epsilon: a floating-point number
+      recompute_grads: a boolean
+    """
+    self._layers = layers
+    self._dropout_rate = dropout_rate
+    self._norm_epsilon = norm_epsilon
+    self._recompute_grads = recompute_grads
 
-  This "fixes" a bug where extreme values leak from the padding into the
-  non-padding regions.
-  TODO(noam): undertand this better and make a more principled fix.
-
-  Args:
-    x: a Tensor
-    layer_stack: ignored
-    context: a Tensor
-  Returns:
-    a Tensor
-  """
-  del layer_stack
-  if isinstance(context.sequence_id, mtf.Tensor):
-    return x * mtf.cast(
-        mtf.not_equal(context.sequence_id, 0), context.activation_dtype)
-  else:
+  def call(self, context, x):
+    """Call the layer stack."""
+    if isinstance(context.sequence_id, mtf.Tensor):
+      # We use this mask to zero out the padding regions at each layer.
+      # This "fixes" a bug where extreme values leak from the padding into the
+      # non-padding regions.
+      # TODO(noam): undertand this better and make a more principled fix.
+      mask = mtf.cast(
+          mtf.not_equal(context.sequence_id, 0), context.activation_dtype)
+    else:
+      mask = None
+    x = self._dropout(context, x)
+    if context.layer_outputs is not None:
+      context.layer_outputs.append(x)
+    for lnum, layer in enumerate(self._layers):
+      with tf.variable_scope(layer.name or ""):
+        if self._recompute_grads:
+          def fn(x, l=layer, c=context, m=mask):
+            return self._layer_fn(x, l, c, m)
+          x = mtf.recompute_grad(fn, [x])
+        else:
+          x = self._layer_fn(x, layer, context, mask)
+      if context.layer_outputs is not None and lnum != len(self._layers) - 1:
+        context.layer_outputs.append(x)
+      context.layer_index += 1
+    x = self._layer_norm(context, x, name="final_layer_norm")
+    x = self._dropout(context, x)
+    if mask:
+      x *= mask
+    if context.layer_outputs is not None:
+      context.layer_outputs.append(x)
     return x
 
+  @property
+  def _layer_fn_add_residual(self):
+    return True
 
-@gin.configurable
-def sublayer_rms_norm(x, layer_stack, context, epsilon=1e-6, name="rms_norm"):
-  """RMS normalization.
+  def _layer_fn(self, x, layer, context, mask):
+    """Helper method for executing a layer and the stuff around it.
 
-  Args:
-    x: an input mtf.Tensor
-    layer_stack: a LayerStack
-    context: a Context
-    epsilon: a float
-    name: a string
-  Returns:
-    a mtf.Tensor
-  """
-  del layer_stack
-  model_dim = context.model.model_dim
-  with tf.variable_scope(name):
-    scale = mtf.get_variable(
-        context.mesh,
-        "scale",
-        mtf.Shape(context.model.ensemble_dims + [model_dim]),
-        initializer=tf.ones_initializer(),
-        dtype=context.variable_dtype)
-    variance = mtf.reduce_mean(mtf.square(x), reduced_dim=model_dim)
-  return x * mtf.rsqrt(variance + epsilon) * scale
+    Args:
+      x: a Tensor
+      layer: a Layer
+      context: a Context
+      mask: an optional Tensor
+    Returns:
+      a Tensor
+    """
+    norm_x = self._layer_norm(context, (x * mask) if mask else x)
+    with tf.variable_scope(layer.__class__.__name__):
+      y = layer.call(context, norm_x)
+      if y.shape != x.shape:
+        raise ValueError("Layer %s returned misshaped output x=%s y=%s"
+                         % (layer.__class__.__name__, x, y))
+    y = self._dropout(context, y)
+    if self._layer_fn_add_residual:
+      y += x
+    return y
 
+  def _dropout(self, context, x):
+    if context.train and self._dropout_rate > 0:
+      return mtf.dropout(
+          x, rate=self._dropout_rate,
+          noise_shape=mtf.Shape(context.batch_dims + [context.model.model_dim]))
+    else:
+      return x
 
-@gin.configurable
-def sublayer_legacy_rms_norm(x, layer_stack, context):
-  """Deprecated - keep for checkpoint/operative_config.gin compatibility."""
-  return sublayer_rms_norm(x, layer_stack, context, name="layer_norm")
+  def _layer_norm(self, context, x, name=None):
+    return layer_norm(context, x, self._norm_epsilon, name)
 
+  @property
+  def num_layers(self):
+    return len(self.layers)
 
-@gin.configurable
-def sublayer_legacy_final_rms_norm(x, layer_stack, context):
-  """Deprecated - keep for checkpoint/operative_config.gin compatibility."""
-  return sublayer_rms_norm(x, layer_stack, context, name="final_layer_norm")
-
-
-@gin.configurable
-def sublayer_rms_norm_subsampled(x, layer_stack, context, percentage=100.,
-                                 epsilon=1e-6):
-  """RMS normalization."""
-  del layer_stack
-  model_dim = context.model.model_dim
-  with tf.variable_scope("layer_norm_subsampled"):
-    scale = mtf.get_variable(
-        context.mesh,
-        "scale",
-        mtf.Shape(context.model.ensemble_dims + [model_dim]),
-        initializer=tf.ones_initializer(),
-        dtype=context.variable_dtype)
-    var_dim = mtf.Dimension(
-        model_dim.name,
-        int(math.ceil(model_dim.size * percentage/100)))
-    var_activations = mtf.slice(x, 0, var_dim.size, var_dim.name)
-    variance = mtf.reduce_mean(
-        mtf.square(var_activations), reduced_dim=var_dim)
-  return x * mtf.rsqrt(variance + epsilon) * scale
-
-
-@gin.configurable
-def sublayer_residual(x, layer_stack, context):
-  del layer_stack
-  return x + context.current_layer_input
-
-
-@gin.configurable
-def sublayer_dropout(x, layer_stack, context, dropout_rate=0.0):
-  del layer_stack
-  if context.train and dropout_rate > 0:
-    return mtf.dropout(
-        x, rate=dropout_rate,
-        noise_shape=mtf.Shape(context.batch_dims + [context.model.model_dim]))
-  else:
-    return x
-
-
-@gin.configurable
-def sublayer_legacy_dropout(x, layer_stack, context):
-  return sublayer_dropout(x, layer_stack, context,
-                          dropout_rate=layer_stack.dropout_rate)
-
-
-@gin.configurable
-def sublayer_rezero(x, layer_stack, context, initial_value=0.0):
-  """Multiply by zero-initialized scalar (residual not included)."""
-  del layer_stack
-  rezero_weight = mtf.get_variable(
-      x.mesh, "rezero_weight", shape=context.model.ensemble_dims,
-      dtype=context.variable_dtype,
-      initializer=tf.constant_initializer(initial_value))
-  return x * rezero_weight
-
-
+  @property
+  def layers(self):
+    return self._layers
 
 
 @gin.configurable
@@ -591,40 +1053,77 @@ class ReversibleLayerStack(LayerStack):
   This should be very memory-efficient if LayerStack.recompute_grads
   is set to True.
 
-  Also, sublayers_per_layer should be overridden in gin, so as to remove the
-  residual.
-
   "Reformer" https://arxiv.org/abs/2001.04451 uses something like this.
   """
 
   def call(self, context, x):
     """Call the layer stack."""
-    x = self._call_sublayers(self._sublayers_initial, x, context)
-    context.layer_outputs.append(x)
+    if isinstance(context.sequence_id, mtf.Tensor):
+      # We use this mask to zero out the padding regions at each layer.
+      # This "fixes" a bug where extreme values leak from the padding into the
+      # non-padding regions.
+      # TODO(noam): undertand this better and make a more principled fix.
+      mask = mtf.cast(
+          mtf.not_equal(context.sequence_id, 0), context.activation_dtype)
+    else:
+      mask = None
+    x = self._dropout(context, x)
+    if context.layer_outputs is not None:
+      context.layer_outputs.append(x)
     x1, x1_backwards, x2, x2_backwards = x, None, x, None
     for lnum, layer in enumerate(self._layers):
       with tf.variable_scope(layer.name or ""):
-        def fn(x, l=layer, c=context):
-          return self._layer_fn(x, l, c)
+        def fn(x, l=layer, c=context, m=mask):
+          return self._layer_fn(x, l, c, m)
         x1, x1_backwards, x2, x2_backwards = (
             mtf.layers.reversible_half_residual_and_swap(
                 x1, x1_backwards, x2, x2_backwards, fn,
                 recompute_grads=self._recompute_grads))
-      if lnum != len(self._layers) - 1:
+      if context.layer_outputs is not None and lnum != len(self._layers) - 1:
         context.layer_outputs.append(x)
       context.layer_index += 1
     x = x1 + x2
-    x = self._call_sublayers(self._sublayers_final, x, context)
-    context.layer_outputs.append(x)
+    x = self._layer_norm(context, x, name="final_layer_norm")
+    x = self._dropout(context, x)
+    if mask:
+      x *= mask
+    if context.layer_outputs is not None:
+      context.layer_outputs.append(x)
     return x
 
+  @property
+  def _layer_fn_add_residual(self):
+    return False
 
-@gin.configurable
-def sublayer_true_layer_norm(x, layer_stack, context):
-  """True (aka normal) Normalization."""
-  model_dim = context.model.model_dim
-  with tf.variable_scope("true_layer_norm"):
-    return mtf.layers.layer_norm(x, model_dim, layer_stack.norm_epsilon)
+
+def layer_norm(context, x, norm_epsilon, name=None, model_dim=None):
+  """Layer normalization.
+
+  Args:
+    context: a Context
+    x: a Tensor
+    norm_epsilon: a float
+    name: an optional string
+    model_dim: an optional mtf.Dimension to use in place of the one attached to
+      the context
+
+  Returns:
+    a Tensor
+  """
+  if model_dim is None:
+    model_dim = context.model.model_dim
+  with tf.variable_scope(name, default_name="layer_norm"):
+    scale_shape = [model_dim]
+    if context.model.ensemble_dim:
+      scale_shape = [context.model.ensemble_dim] + scale_shape
+    scale = mtf.get_variable(
+        context.mesh,
+        "scale",
+        mtf.Shape(scale_shape),
+        initializer=tf.ones_initializer(),
+        dtype=context.variable_dtype)
+    variance = mtf.reduce_mean(mtf.square(x), reduced_dim=model_dim)
+  return x * mtf.rsqrt(variance + norm_epsilon) * scale
 
 
 @gin.configurable
@@ -704,10 +1203,8 @@ class Unitransformer(object):
     """
     self.layer_stack = layer_stack
     self.model_dim = mtf.Dimension("d_model", d_model)
-    self.input_vocab_size_unpadded = input_vocab_size
     self.input_vocab_dim = mtf.Dimension(
         "vocab", _round_up_to_multiple(input_vocab_size, vocab_divisor))
-    self.output_vocab_size_unpadded = output_vocab_size
     if output_vocab_size:
       self.output_vocab_dim = mtf.Dimension(
           "vocab", _round_up_to_multiple(output_vocab_size, vocab_divisor))
@@ -731,6 +1228,7 @@ class Unitransformer(object):
     self.mesh_shape = mesh_shape
     self.ensemble_dim = (
         mtf.Dimension("ensemble", ensemble) if ensemble else None)
+    self.ensemble_dims = [self.ensemble_dim] if ensemble else []
     self._loss_fn = loss_fn
     self.positional_embedding = positional_embedding
     self.sinusoid_positional_embedding = sinusoid_positional_embedding
@@ -745,10 +1243,6 @@ class Unitransformer(object):
   @property
   def fully_autoregressive(self):
     return self.autoregressive and not self.input_full_attention
-
-  @property
-  def ensemble_dims(self):
-    return [self.ensemble_dim] if self.ensemble_dim else []
 
   def _compute_loss(self, context, logits, targets, output_vocab_dim):
     """Regular cross entropy loss.
@@ -1455,14 +1949,6 @@ class Bitransformer(object):
       logits: a Tensor with shape [<batch_dims>, output_vocab_dim]
       loss: an optional Scalar (if compute_loss=True)
     """
-    # encoder_sequene_id and decoder_sequence_id are used to delineate packed
-    # examples but are also necessary to indicate padding where sequence_id==0.
-    # If they are absent, then we assume that padding is indicated by zeros in
-    # the inputs/targets, and we make up sequence_id tensors to indicate this.
-    if encoder_sequence_id is None:
-      encoder_sequence_id = mtf.minimum(inputs, 1)
-    if decoder_sequence_id is None:
-      decoder_sequence_id = mtf.minimum(targets, 1)
     encoder_layer_outputs = []
     shared_params = self._shared_params(inputs.mesh, variable_dtype)
     encoder_output, encoder_loss = self.encoder.call_simple(
