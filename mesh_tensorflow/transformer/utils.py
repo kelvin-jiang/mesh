@@ -1082,8 +1082,7 @@ def decode(estimator,
   for i, result in enumerate(result_iter):
     input_string = _maybe_detokenize(
         result["inputs"], inputs_vocabulary(vocabulary))
-    output_string = _maybe_detokenize(
-        result["outputs"], targets_vocabulary(vocabulary))
+    output_string = "\t".join([str(float(l)) for l in result["outputs"][0].tolist()])
     decodes.append(output_string)
     if i & (i - 1) == 0:
       # LOG every power of 2.
